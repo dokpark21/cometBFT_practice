@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"log"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/dgraph-io/badger"
@@ -24,7 +25,31 @@ func (app *KVStoreApplication) Info(_ context.Context, info *abcitypes.RequestIn
 }
 
 func (app *KVStoreApplication) Query(_ context.Context, req *abcitypes.RequestQuery) (*abcitypes.ResponseQuery, error) {
-	return &abcitypes.ResponseQuery{}, nil
+	resp := abcitypes.ResponseQuery{Key: req.Data}
+
+	dbErr := app.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(req.Data)
+		if err != nil {
+			if err != badger.ErrKeyNotFound {
+				return err
+			}
+
+			resp.Log = "Key not found"
+			return nil
+		}
+
+		return item.Value(func(val []byte) error {
+			resp.Log = "Key found"
+			resp.Value = val
+			return nil
+		})
+	})
+
+	if dbErr != nil {
+		log.Panicf("Error querying database: %v", dbErr)
+	}
+
+	return &resp, nil
 }
 
 // CheckTx does not execute the transaction, but checks it could be executed.
@@ -46,11 +71,31 @@ func (app *KVStoreApplication) ProcessProposal(_ context.Context, proposal *abci
 }
 
 func (app *KVStoreApplication) FinalizeBlock(_ context.Context, req *abcitypes.RequestFinalizeBlock) (*abcitypes.ResponseFinalizeBlock, error) {
-	return &abcitypes.ResponseFinalizeBlock{}, nil
+	var txs = make([]*abcitypes.ExecTxResult, len(req.Txs))
+
+	app.onGoingBlock = app.db.NewTransaction(true)
+	for i, tx := range req.Txs {
+		if code := app.isValid(tx); code != 0 {
+			log.Printf("Error: invalid transaction index %v", i)
+			txs[i] = &abcitypes.ExecTxResult{Code: code}
+		} else {
+			parts := bytes.SplitN(tx, []byte("="), 2)
+			key, value := parts[0], parts[1]
+			log.Printf("Set key: %s, value: %s", key, value)
+
+			if err := app.onGoingBlock.Set(key, value); err != nil {
+				log.Panicf("Error writing to database, unable to execute tx: %v", err)
+			}
+			log.Printf("Successfully set key: %s, value: %s", key, value)
+
+			txs[i] = &abcitypes.ExecTxResult{}
+		}
+	}
+	return &abcitypes.ResponseFinalizeBlock{TxResults: txs}, nil
 }
 
 func (app KVStoreApplication) Commit(_ context.Context, commit *abcitypes.RequestCommit) (*abcitypes.ResponseCommit, error) {
-	return &abcitypes.ResponseCommit{}, nil
+	return &abcitypes.ResponseCommit{}, app.onGoingBlock.Commit()
 }
 
 func (app *KVStoreApplication) ListSnapshots(_ context.Context, snapshots *abcitypes.RequestListSnapshots) (*abcitypes.ResponseListSnapshots, error) {
